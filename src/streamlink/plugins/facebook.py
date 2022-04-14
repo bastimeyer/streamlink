@@ -1,19 +1,18 @@
 """
-$description Global live streaming and video hosting social platform.
+$description Global live-streaming and video hosting social platform.
 $url facebook.com
 $type live, vod
 """
 
 import logging
 import re
-from html import unescape as html_unescape
-from urllib.parse import unquote_plus, urlencode
+from urllib.parse import urlencode
 
-from streamlink.plugin import Plugin, pluginmatcher
-from streamlink.plugin.api.utils import itertags
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
+from streamlink.plugin.api import validate
 from streamlink.stream.dash import DASHStream
 from streamlink.stream.http import HTTPStream
-from streamlink.utils.parse import parse_json
+
 
 log = logging.getLogger(__name__)
 
@@ -24,122 +23,163 @@ log = logging.getLogger(__name__)
     /[^/]+/(?:posts|videos)/(?P<video_id>\d+)
 """, re.VERBOSE))
 class Facebook(Plugin):
-    _src_re = re.compile(r'''(sd|hd)_src["']?\s*:\s*(?P<quote>["'])(?P<url>.+?)(?P=quote)''')
-    _dash_manifest_re = re.compile(r'''dash_manifest["']?\s*:\s*["'](?P<manifest>.+?)["'],''')
-    _playlist_re = re.compile(r'''video:\[({url:".+?}\])''')
-    _plurl_re = re.compile(r'''url:"(.*?)"''')
-    _pc_re = re.compile(r'''pkg_cohort["']\s*:\s*["'](.+?)["']''')
-    _rev_re = re.compile(r'''client_revision["']\s*:\s*(\d+),''')
-    _dtsg_re = re.compile(r'''DTSGInitialData["'],\s*\[\],\s*{\s*["']token["']\s*:\s*["'](.+?)["']''')
-    _title_re = re.compile(r'<meta property="og:title" content="([^\"]+)"')
-    _DEFAULT_PC = "PHASED:DEFAULT"
-    _DEFAULT_REV = 4681796
-    _TAHOE_URL = "https://www.facebook.com/video/tahoe/async/{0}/?chain=true&isvideo=true&payloadtype=primary"
-
-    def get_title(self):
-        res = self.session.http.get(self.url)
-        m = self._title_re.search(res.text)
-        if m:
-            return html_unescape(m.group(1))
-
-    def _parse_streams(self, res):
-        _found_stream_url = False
-        for meta in itertags(res.text, "meta"):
-            if meta.attributes.get("property") == "og:video:url":
-                stream_url = html_unescape(meta.attributes.get("content"))
-                if ".mpd" in stream_url:
-                    for s in DASHStream.parse_manifest(self.session, stream_url).items():
-                        yield s
-                        _found_stream_url = True
-                elif ".mp4" in stream_url:
-                    yield "vod", HTTPStream(self.session, stream_url)
-                    _found_stream_url = True
-                break
-        else:
-            log.debug("No meta og:video:url")
-
-        if _found_stream_url:
-            return
-
-        for match in self._src_re.finditer(res.text):
-            stream_url = match.group("url")
-            if "\\/" in stream_url:
-                # if the URL is json encoded, decode it
-                stream_url = parse_json("\"{}\"".format(stream_url))
-            if ".mpd" in stream_url:
-                yield from DASHStream.parse_manifest(self.session, stream_url).items()
-            elif ".mp4" in stream_url:
-                yield match.group(1), HTTPStream(self.session, stream_url)
-            else:
-                log.debug("Non-dash/mp4 stream: {0}".format(stream_url))
-
-        match = self._dash_manifest_re.search(res.text)
-        if match:
-            # facebook replaces "<" characters with the substring "\\x3C"
-            manifest = match.group("manifest").replace("\\/", "/")
-            manifest = bytes(unquote_plus(manifest), "utf-8").decode("unicode_escape")
-            # Ignore unsupported manifests until DASH SegmentBase support is implemented
-            if "SegmentBase" in manifest:
-                log.error("Skipped DASH manifest with SegmentBase streams")
-            else:
-                yield from DASHStream.parse_manifest(self.session, manifest).items()
-
-    def _get_streams(self):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.session.set_option("ffmpeg-start-at-zero", True)
-        self.session.http.headers.update({"Accept-Language": "en-US"})
 
-        done = False
-        res = self.session.http.get(self.url)
-        log.trace(f"{res.url}")
-        for title in itertags(res.text, "title"):
-            if title.text.startswith("Log into Facebook"):
-                log.error("Video is not available, You must log in to continue.")
-                return
+    def _find_stream(self, quality, stream_url):
+        if ".mpd" in stream_url:
+            return DASHStream.parse_manifest(self.session, stream_url)
+        elif ".mp4" in stream_url:
+            return {quality: HTTPStream(self.session, stream_url)}
 
-        for s in self._parse_streams(res):
-            done = True
-            yield s
-        if done:
+    def _find_meta(self, root):
+        try:
+            schema = validate.Schema(
+                validate.xml_xpath_string(".//head/meta[@property='og:video:url'][@content][1]/@content"),
+                str,
+                validate.url(),
+            )
+            stream_url = schema.validate(root)
+        except PluginError:
+            log.debug("No meta og:video:url")
             return
+
+        return self._find_stream("vod", stream_url)
+
+    # TODO: check validity of this method and fix/improve xpath query (see _find_manifest)
+    def _find_src(self, root):
+        try:
+            re_src = re.compile(r"""(?P<quality>sd|hd)_src["']?\s*:\s*(?P<quote>["'])(?P<url>.+?)(?P=quote)""")
+            schema = validate.Schema(
+                validate.xml_xpath_string(".//script[contains(text(),'_src')][1]/text()"),
+                str,
+                validate.transform(re_src.search),
+                validate.union((
+                    validate.get("quality"),
+                    validate.all(
+                        validate.get("url"),
+                        validate.transform(lambda url: f"{{\"url\":\"{url}\"}}"),
+                        validate.parse_json(),
+                        validate.get("url"),
+                        validate.url()
+                    )
+                ))
+            )
+            quality, stream_url = schema.validate(root)
+        except PluginError:
+            log.debug("Non-dash/mp4 stream")
+            return
+
+        return self._find_stream(quality, stream_url)
+
+    def _find_manifest(self, root):
+        try:
+            re_manifest = re.compile(r"""(?P<json>"dash_manifest"\s*:\s*".+?"),""")
+            schema = validate.Schema(
+                validate.xml_xpath_string(".//script[contains(text(),'\"dash_manifest\"')][1]/text()"),
+                str,
+                validate.transform(re_manifest.search),
+                validate.get("json"),
+                validate.transform(lambda json: f"{{{json}}}"),
+                validate.parse_json(),
+                validate.get("dash_manifest"),
+                validate.startswith("<?xml")
+            )
+            manifest = schema.validate(root)
+        except PluginError:
+            log.debug("No dash_manifest")
+            return
+
+        # Ignore unsupported manifests until DASH SegmentBase support is implemented
+        if "SegmentBase" in manifest:
+            log.error("Skipped DASH manifest with SegmentBase streams")
+            return
+
+        return DASHStream.parse_manifest(self.session, manifest)
+
+    def _parse_streams(self, root):
+        return self._find_meta(root) \
+            or self._find_src(root) \
+            or self._find_manifest(root)
+
+    # TODO: rewrite and replace this with proper validation schemas
+    def _find_tahoe(self, root):
+        from lxml import etree
+
+        text = etree.canonicalize(root)
+
+        _playlist_re = re.compile(r'''video:\[({url:".+?}])''')
+        _plurl_re = re.compile(r'''url:"(.*?)"''')
+        _pc_re = re.compile(r'''pkg_cohort["']\s*:\s*["'](.+?)["']''')
+        _rev_re = re.compile(r'''client_revision["']\s*:\s*(\d+),''')
+        _dtsg_re = re.compile(r'''DTSGInitialData["'],\s*\[],\s*{\s*["']token["']\s*:\s*["'](.+?)["']''')
+        _DEFAULT_PC = "PHASED:DEFAULT"
+        _DEFAULT_REV = 4681796
+        _TAHOE_URL = "https://www.facebook.com/video/tahoe/async/{0}/?chain=true&isvideo=true&payloadtype=primary"
 
         # fallback on to playlist
         log.debug("Falling back to playlist regex")
-        match = self._playlist_re.search(res.text)
+        match = _playlist_re.search(text)
         playlist = match and match.group(1)
         if playlist:
-            match = self._plurl_re.search(playlist)
+            match = _plurl_re.search(playlist)
             if match:
                 url = match.group(1)
-                yield "sd", HTTPStream(self.session, url)
-                return
+                return {"sd": HTTPStream(self.session, url)}
 
         # fallback to tahoe player url
         log.debug("Falling back to tahoe player")
         video_id = self.match.group("video_id")
-        url = self._TAHOE_URL.format(video_id)
+        url = _TAHOE_URL.format(video_id)
         data = {
             "__a": 1,
-            "__pc": self._DEFAULT_PC,
-            "__rev": self._DEFAULT_REV,
+            "__pc": _DEFAULT_PC,
+            "__rev": _DEFAULT_REV,
             "fb_dtsg": "",
         }
-        match = self._pc_re.search(res.text)
+        match = _pc_re.search(text)
         if match:
             data["__pc"] = match.group(1)
-        match = self._rev_re.search(res.text)
+        match = _rev_re.search(text)
         if match:
             data["__rev"] = match.group(1)
-        match = self._dtsg_re.search(res.text)
+        match = _dtsg_re.search(text)
         if match:
             data["fb_dtsg"] = match.group(1)
-        res = self.session.http.post(
+        root = self.session.http.post(
             url,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data=urlencode(data).encode("ascii")
+            headers={
+                "Accept-Language": "en-US",
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            data=urlencode(data).encode("ascii"),
+            schema=validate.Schema(validate.parse_html())
         )
 
-        for s in self._parse_streams(res):
-            yield s
+        return self._parse_streams(root)
+
+    def _get_streams(self):
+        root, canonical, self.title = self.session.http.get(
+            self.url,
+            headers={
+                "Accept-Language": "en-US"
+            },
+            schema=validate.Schema(
+                validate.parse_html(),
+                validate.union((
+                    validate.xml_find("."),
+                    validate.xml_xpath_string(".//head/meta[@res='canonical'][1]/@href"),
+                    validate.xml_xpath_string(".//head/meta[@property='og:title'][1]/@content"),
+                ))
+            )
+        )
+        if canonical == "https://www.facebook.com/login/" or "log in" in self.title.lower():
+            log.error("This URL requires a login or may be accessible from a different IP address.")
+            return
+
+        return self._parse_streams(root) \
+            or self._find_tahoe(root)
 
 
 __plugin__ = Facebook
