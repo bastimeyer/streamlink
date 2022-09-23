@@ -20,6 +20,10 @@ log = logging.getLogger(__name__)
 class Showroom(Plugin):
     LIVE_STATUS = 2
 
+    @classmethod
+    def stream_weight(cls, stream):
+        return (int(stream.split("_")[1]), "bitrate") if "_" in stream else (0, "none")
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.session.set_option("hls-playlist-reload-time", "segment")
@@ -60,30 +64,40 @@ class Showroom(Plugin):
             log.info("This stream is currently offline")
             return
 
-        url = self.session.http.get(
+        streams = self.session.http.get(
             "https://www.showroom-live.com/api/live/streaming_url",
-            params={
-                "room_id": room_id,
-                "abr_available": 1,
-            },
+            params={"room_id": room_id},
             schema=validate.Schema(
                 validate.parse_json(),
-                {"streaming_url_list": [{
-                    "type": str,
-                    "url": validate.url(),
-                }]},
+                {
+                    "streaming_url_list": [
+                        validate.all(
+                            {
+                                "type": str,
+                                "quality": int,
+                                "url": validate.url(),
+                            },
+                            validate.union_get(
+                                "type",
+                                "quality",
+                                "url",
+                            ),
+                        ),
+                    ],
+                },
                 validate.get("streaming_url_list"),
-                validate.filter(lambda p: p["type"] == "hls_all"),
-                validate.get((0, "url")),
             ),
         )
+        if not streams:
+            return
 
-        res = self.session.http.get(url, acceptable_status=(200, 403, 404))
+        res = self.session.http.get(streams[0][2], acceptable_status=(200, 403, 404))
         if res.headers["Content-Type"] != "application/x-mpegURL":
             log.error("This stream is restricted")
             return
 
-        return HLSStream.parse_variant_playlist(self.session, url)
+        for streamtype, quality, url in streams:
+            yield f"{streamtype}_{quality}", HLSStream(self.session, url)
 
 
 __plugin__ = Showroom
