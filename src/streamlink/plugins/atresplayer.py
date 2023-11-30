@@ -70,17 +70,18 @@ class AtresPlayer(Plugin):
             log.error(f"Player API error: {sources['error']} - {sources['error_description']}")
             return
 
+        headers = {"Accept-Encoding": "identity"}
         for streamtype, streamsrc in sources.get("sources"):
             log.debug(f"Stream source: {streamsrc} ({streamtype or 'n/a'})")
 
             if streamtype == "application/vnd.apple.mpegurl":
-                streams = HLSStream.parse_variant_playlist(self.session, streamsrc)
+                streams = HLSStream.parse_variant_playlist(self.session, streamsrc, headers=headers)
                 if not streams:
-                    yield "live", HLSStream(self.session, streamsrc)
+                    yield "live", HLSStream(self.session, streamsrc, headers=headers)
                 else:
                     yield from streams.items()
             elif streamtype == "application/dash+xml":
-                yield from DASHStream.parse_manifest(self.session, streamsrc).items()
+                yield from DASHStream.parse_manifest(self.session, streamsrc, headers=headers).items()
 
 
 __plugin__ = AtresPlayer
