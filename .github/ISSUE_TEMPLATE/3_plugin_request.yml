@@ -1,8 +1,7 @@
 name: 🧩 Plugin request
 description: Discuss adding a new plugin to Streamlink.
 title: "Name of the website / streaming provider"
-labels:
-  - plugin request
+type: plugin request
 body:
   - type: markdown
     attributes:

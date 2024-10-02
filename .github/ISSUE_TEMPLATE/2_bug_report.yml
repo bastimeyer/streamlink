@@ -1,8 +1,7 @@
 name: 🐛 Bug Report
 description: A core functionality of Streamlink is broken.
 title: "A very brief summary of what's broken"
-labels:
-  - bug
+type: bug
 body:
   - type: markdown
     attributes:

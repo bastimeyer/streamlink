@@ -1,8 +1,7 @@
 name: 🧩 Plugin issue
 description: One of Streamlink's plugins doesn't work correctly.
 title: "plugins.plugin-name-here: A very brief summary of what's broken"
-labels:
-  - plugin issue
+type: plugin issue
 body:
   - type: markdown
     attributes:

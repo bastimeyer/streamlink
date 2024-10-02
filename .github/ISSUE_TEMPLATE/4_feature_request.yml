@@ -1,8 +1,7 @@
 name: ⚙️ Feature request
 description: Discuss adding new functionality to Streamlink.
 title: "A very brief summary of your request"
-labels:
-  - feature request
+type: feature request
 body:
   - type: markdown
     attributes:
